@@ -44,6 +44,12 @@ static std::string get_line_col(const std::string & source, size_t pos) {
     return "line " + std::to_string(line) + ", column " + std::to_string(col);
 }
 
+static void ensure_key_type_allowed(const value & val) {
+    if (!val->is_hashable()) {
+        throw std::runtime_error("Type: " + val->type() + " is not allowed as object key");
+    }
+}
+
 // execute with error handling
 value statement::execute(context & ctx) {
     try {
@@ -79,7 +85,7 @@ value identifier::execute_impl(context & ctx) {
     auto builtins = global_builtins();
     if (!it->is_undefined()) {
         if (ctx.is_get_stats) {
-            it->stats.used = true;
+            value_t::stats_t::mark_used(it);
         }
         JJ_DEBUG("Identifier '%s' found, type = %s", val.c_str(), it->type().c_str());
         return it;
@@ -95,20 +101,10 @@ value identifier::execute_impl(context & ctx) {
 value object_literal::execute_impl(context & ctx) {
     auto obj = mk_val<value_object>();
     for (const auto & pair : val) {
-        value key_val = pair.first->execute(ctx);
-        if (!is_val<value_string>(key_val) && !is_val<value_int>(key_val)) {
-            throw std::runtime_error("Object literal: keys must be string or int values, got " + key_val->type());
-        }
-        std::string key = key_val->as_string().str();
+        value key = pair.first->execute(ctx);
         value val = pair.second->execute(ctx);
-        JJ_DEBUG("Object literal: setting key '%s' with value type %s", key.c_str(), val->type().c_str());
+        JJ_DEBUG("Object literal: setting key '%s' with value type %s", key->as_string().str().c_str(), val->type().c_str());
         obj->insert(key, val);
-
-        if (is_val<value_int>(key_val)) {
-            obj->val_obj.is_key_numeric = true;
-        } else if (obj->val_obj.is_key_numeric) {
-            throw std::runtime_error("Object literal: cannot mix numeric and non-numeric keys");
-        }
     }
     return obj;
 }
@@ -118,8 +114,10 @@ value binary_expression::execute_impl(context & ctx) {
 
     // Logical operators
     if (op.value == "and") {
+        JJ_DEBUG("Executing logical test: %s AND %s", left->type().c_str(), right->type().c_str());
         return left_val->as_bool() ? right->execute(ctx) : std::move(left_val);
     } else if (op.value == "or") {
+        JJ_DEBUG("Executing logical test: %s OR %s", left->type().c_str(), right->type().c_str());
         return left_val->as_bool() ? std::move(left_val) : right->execute(ctx);
     }
 
@@ -127,9 +125,9 @@ value binary_expression::execute_impl(context & ctx) {
     value right_val = right->execute(ctx);
     JJ_DEBUG("Executing binary expression %s '%s' %s", left_val->type().c_str(), op.value.c_str(), right_val->type().c_str());
     if (op.value == "==") {
-        return mk_val<value_bool>(value_compare(left_val, right_val, value_compare_op::eq));
+        return mk_val<value_bool>(*left_val == *right_val);
     } else if (op.value == "!=") {
-        return mk_val<value_bool>(!value_compare(left_val, right_val, value_compare_op::eq));
+        return mk_val<value_bool>(!(*left_val == *right_val));
     }
 
     auto workaround_concat_null_with_str = [&](value & res) -> bool {
@@ -146,6 +144,13 @@ value binary_expression::execute_impl(context & ctx) {
             return true;
         }
         return false;
+    };
+
+    auto test_is_in = [&]() -> bool {
+        func_args args(ctx);
+        args.push_back(left_val);
+        args.push_back(right_val);
+        return global_builtins().at("test_is_in")(args)->as_bool();
     };
 
     // Handle undefined and null values
@@ -227,19 +232,11 @@ value binary_expression::execute_impl(context & ctx) {
             return result;
         }
     } else if (is_val<value_array>(right_val)) {
-        auto & arr = right_val->as_array();
-        bool member = false;
-        for (const auto & item : arr) {
-            if (value_compare(left_val, item, value_compare_op::eq)) {
-                member = true;
-                break;
-            }
-        }
+        // case: 1 in [0, 1, 2]
+        bool member = test_is_in();
         if (op.value == "in") {
-            JJ_DEBUG("Checking membership: %s in Array is %d", left_val->type().c_str(), member);
             return mk_val<value_bool>(member);
         } else if (op.value == "not in") {
-            JJ_DEBUG("Checking non-membership: %s not in Array is %d", left_val->type().c_str(), !member);
             return mk_val<value_bool>(!member);
         }
     }
@@ -254,25 +251,42 @@ value binary_expression::execute_impl(context & ctx) {
         return res;
     }
 
+    // Python-style string repetition
+    // TODO: support array/tuple repetition (e.g., [1, 2] * 3 → [1, 2, 1, 2, 1, 2])
+    if (op.value == "*" &&
+            ((is_val<value_string>(left_val) && is_val<value_int>(right_val)) ||
+             (is_val<value_int>(left_val) && is_val<value_string>(right_val)))) {
+        const auto & str = is_val<value_string>(left_val) ? left_val->as_string() : right_val->as_string();
+        const int64_t repeat = is_val<value_int>(right_val) ? right_val->as_int() : left_val->as_int();
+        auto res = mk_val<value_string>();
+        if (repeat <= 0) {
+            return res;
+        }
+        for (int64_t i = 0; i < repeat; ++i) {
+            res->val_str = res->val_str.append(str);
+        }
+        return res;
+    }
+
     // String membership
     if (is_val<value_string>(left_val) && is_val<value_string>(right_val)) {
-        auto left_str = left_val->as_string().str();
-        auto right_str = right_val->as_string().str();
+        // case: "a" in "abc"
+        bool member = test_is_in();
         if (op.value == "in") {
-            return mk_val<value_bool>(right_str.find(left_str) != std::string::npos);
+            return mk_val<value_bool>(member);
         } else if (op.value == "not in") {
-            return mk_val<value_bool>(right_str.find(left_str) == std::string::npos);
+            return mk_val<value_bool>(!member);
         }
     }
 
-    // String in object
-    if (is_val<value_string>(left_val) && is_val<value_object>(right_val)) {
-        auto key = left_val->as_string().str();
-        bool has_key = right_val->has_key(key);
+    // Value key in object
+    if (is_val<value_object>(right_val)) {
+        // case: key in {key: value}
+        bool member = test_is_in();
         if (op.value == "in") {
-            return mk_val<value_bool>(has_key);
+            return mk_val<value_bool>(member);
         } else if (op.value == "not in") {
-            return mk_val<value_bool>(!has_key);
+            return mk_val<value_bool>(!member);
         }
     }
 
@@ -282,7 +296,7 @@ value binary_expression::execute_impl(context & ctx) {
 static value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing = false) {
     JJ_DEBUG("Trying built-in function '%s' for type %s", name.c_str(), input->type().c_str());
     if (ctx.is_get_stats) {
-        input->stats.used = true;
+        value_t::stats_t::mark_used(input);
         input->stats.ops.insert(name);
     }
     auto builtins = input->get_builtins();
@@ -309,6 +323,19 @@ value filter_expression::execute_impl(context & ctx) {
             filter_id = "strip"; // alias
         }
         JJ_DEBUG("Applying filter '%s' to %s", filter_id.c_str(), input->type().c_str());
+        // TODO: Refactor filters so this coercion can be done automatically
+        if (!input->is_undefined() && !is_val<value_string>(input) && (
+            filter_id == "capitalize" ||
+            filter_id == "lower" ||
+            filter_id == "replace" ||
+            filter_id == "strip" ||
+            filter_id == "title" ||
+            filter_id == "upper" ||
+            filter_id == "wordcount"
+        )) {
+            JJ_DEBUG("Coercing %s to String for '%s' filter", input->type().c_str(), filter_id.c_str());
+            input = mk_val<value_string>(input->as_string());
+        }
         return try_builtin_func(ctx, filter_id, input)->invoke(func_args(ctx));
 
     } else if (is_stmt<call_expression>(filter)) {
@@ -451,6 +478,12 @@ value for_statement::execute_impl(context & ctx) {
 
     value iterable_val = iter_expr->execute(scope);
 
+    // mark the variable being iterated as used for stats
+    if (ctx.is_get_stats) {
+        value_t::stats_t::mark_used(iterable_val);
+        iterable_val->stats.ops.insert("array_access");
+    }
+
     if (iterable_val->is_undefined()) {
         JJ_DEBUG("%s", "For loop iterable is undefined, skipping loop");
         iterable_val = mk_val<value_array>();
@@ -465,17 +498,11 @@ value for_statement::execute_impl(context & ctx) {
         JJ_DEBUG("%s", "For loop over object keys");
         auto & obj = iterable_val->as_ordered_object();
         for (auto & p : obj) {
-            auto tuple = mk_val<value_array>();
-            if (iterable_val->val_obj.is_key_numeric) {
-                tuple->push_back(mk_val<value_int>(std::stoll(p.first)));
-            } else {
-                tuple->push_back(mk_val<value_string>(p.first));
-            }
-            tuple->push_back(p.second);
-            items.push_back(tuple);
+            auto tuple = mk_val<value_tuple>(p);
+            items.push_back(std::move(tuple));
         }
         if (ctx.is_get_stats) {
-            iterable_val->stats.used = true;
+            value_t::stats_t::mark_used(iterable_val);
             iterable_val->stats.ops.insert("object_access");
         }
     } else {
@@ -485,7 +512,7 @@ value for_statement::execute_impl(context & ctx) {
             items.push_back(item);
         }
         if (ctx.is_get_stats) {
-            iterable_val->stats.used = true;
+            value_t::stats_t::mark_used(iterable_val);
             iterable_val->stats.ops.insert("array_access");
         }
     }
@@ -602,11 +629,13 @@ value set_statement::execute_impl(context & ctx) {
     auto rhs = val ? val->execute(ctx) : exec_statements(body, ctx);
 
     if (is_stmt<identifier>(assignee)) {
+        // case: {% set my_var = value %}
         auto var_name = cast_stmt<identifier>(assignee)->val;
         JJ_DEBUG("Setting global variable '%s' with value type %s", var_name.c_str(), rhs->type().c_str());
         ctx.set_val(var_name, rhs);
 
     } else if (is_stmt<tuple_literal>(assignee)) {
+        // case: {% set a, b = value %}
         auto tuple = cast_stmt<tuple_literal>(assignee);
         if (!is_val<value_array>(rhs)) {
             throw std::runtime_error("Cannot unpack non-iterable type in set: " + rhs->type());
@@ -625,6 +654,7 @@ value set_statement::execute_impl(context & ctx) {
         }
 
     } else if (is_stmt<member_expression>(assignee)) {
+        // case: {% set ns.my_var = value %}
         auto member = cast_stmt<member_expression>(assignee);
         if (member->computed) {
             throw std::runtime_error("Cannot assign to computed member");
@@ -667,8 +697,9 @@ value macro_statement::execute_impl(context & ctx) {
                 if (is_stmt<identifier>(this->args[i])) {
                     // normal parameter
                     std::string param_name = cast_stmt<identifier>(this->args[i])->val;
-                    JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), args.get_pos(i)->type().c_str());
-                    macro_ctx.set_val(param_name, args.get_pos(i));
+                    value param_value = args.get_kwarg_or_pos(param_name, i);
+                    JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), param_value->type().c_str());
+                    macro_ctx.set_val(param_name, param_value);
                 } else if (is_stmt<keyword_argument_expression>(this->args[i])) {
                     // default argument used as normal parameter
                     auto kwarg = cast_stmt<keyword_argument_expression>(this->args[i]);
@@ -676,8 +707,9 @@ value macro_statement::execute_impl(context & ctx) {
                         throw std::runtime_error("Keyword argument key must be an identifier in macro '" + name + "'");
                     }
                     std::string param_name = cast_stmt<identifier>(kwarg->key)->val;
-                    JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), args.get_pos(i)->type().c_str());
-                    macro_ctx.set_val(param_name, args.get_pos(i));
+                    value param_value = args.get_kwarg_or_pos(param_name, i);
+                    JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), param_value->type().c_str());
+                    macro_ctx.set_val(param_name, param_value);
                 } else {
                     throw std::runtime_error("Invalid parameter type in macro '" + name + "'");
                 }
@@ -723,6 +755,8 @@ value member_expression::execute_impl(context & ctx) {
         int64_t arr_size = 0;
         if (is_val<value_array>(object)) {
             arr_size = object->as_array().size();
+        } else if (is_val<value_string>(object)) {
+            arr_size = object->as_string().length();
         }
 
         if (is_stmt<slice_expression>(this->property)) {
@@ -767,22 +801,27 @@ value member_expression::execute_impl(context & ctx) {
     }
 
     JJ_DEBUG("Member expression on object type %s, property type %s", object->type().c_str(), property->type().c_str());
-
     value val = mk_val<value_undefined>("object_property");
+
+    if (property->is_undefined()) {
+        JJ_DEBUG("%s", "Member expression property is undefined, returning undefined");
+        return val;
+    }
+
+    ensure_key_type_allowed(property);
 
     if (is_val<value_undefined>(object)) {
         JJ_DEBUG("%s", "Accessing property on undefined object, returning undefined");
         return val;
+
     } else if (is_val<value_object>(object)) {
-        if (!is_val<value_string>(property)) {
-            throw std::runtime_error("Cannot access object with non-string: got " + property->type());
-        }
         auto key = property->as_string().str();
-        val = object->at(key, val);
+        val = object->at(property, val);
         if (is_val<value_undefined>(val)) {
             val = try_builtin_func(ctx, key, object, true);
         }
         JJ_DEBUG("Accessed property '%s' value, got type: %s", key.c_str(), val->type().c_str());
+
     } else if (is_val<value_array>(object) || is_val<value_string>(object)) {
         if (is_val<value_int>(property)) {
             int64_t index = property->as_int();
@@ -806,6 +845,7 @@ value member_expression::execute_impl(context & ctx) {
             auto key = property->as_string().str();
             JJ_DEBUG("Accessing %s built-in '%s'", is_val<value_array>(object) ? "array" : "string", key.c_str());
             val = try_builtin_func(ctx, key, object, true);
+
         } else {
             throw std::runtime_error("Cannot access property with non-string/non-number: got " + property->type());
         }
@@ -818,8 +858,9 @@ value member_expression::execute_impl(context & ctx) {
     }
 
     if (ctx.is_get_stats && val && object && property) {
-        val->stats.used = true;
-        object->stats.used = true;
+        value_t::stats_t::mark_used(val);
+        value_t::stats_t::mark_used(object);
+        value_t::stats_t::mark_used(property);
         if (is_val<value_int>(property)) {
             object->stats.ops.insert("array_access");
         } else if (is_val<value_string>(property)) {
@@ -836,7 +877,7 @@ value call_expression::execute_impl(context & ctx) {
     for (auto & arg_stmt : this->args) {
         auto arg_val = arg_stmt->execute(ctx);
         JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
-        args.push_back(std::move(arg_val));
+        args.push_back(arg_val);
     }
     // execute callee
     value callee_val = callee->execute(ctx);

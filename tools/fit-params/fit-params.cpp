@@ -17,11 +17,12 @@ using namespace std::chrono_literals;
 int main(int argc, char ** argv) {
     common_params params;
 
+    common_init();
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
-    common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
     auto mparams = common_model_params_to_llama(params);
@@ -36,7 +37,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: printing fitted CLI arguments to stdout...\n", __func__);
     common_log_flush(common_log_main());
-    printf("-c %" PRIu32 " -ngl %" PRIu32, cparams.n_ctx, mparams.n_gpu_layers);
+    printf("-c %" PRIu32 " -ngl %" PRIi32, cparams.n_ctx, mparams.n_gpu_layers);
 
     size_t nd = llama_max_devices();
     while (nd > 1 && mparams.tensor_split[nd - 1] == 0.0f) {
